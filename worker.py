@@ -96,6 +96,19 @@ def run(args):
         bundle = extract_checked(root / 'input.tar.gz', runtime)
         if bundle.get('job_tag') != args.tag or not args.shard < bundle.get('shards', 0):
             raise ValueError('Encrypted workload identity differs')
+        inputs = bundle.get('inputs_by_shard', [])
+        for index, item in enumerate(inputs[args.shard] if inputs else []):
+            if (not re.fullmatch(r'r[0-9a-f]{24}', item['tag'])
+                    or not re.fullmatch(r'[A-Za-z0-9_.-]+', item['asset'])
+                    or not re.fullmatch(r'[a-z0-9_-]+', item['label'])):
+                raise ValueError('Invalid sealed input identity')
+            encrypted_input = root / f'attachment-{index}.box'
+            fetch(args.repo, item['tag'], item['asset'], encrypted_input, item['sha256'])
+            input_archive = root / f'attachment-{index}.tar.gz'
+            unseal(encrypted_input, input_archive, key)
+            recovered = extract_checked(input_archive, runtime / 'inputs' / item['label'])
+            if recovered.get('identity') != item['identity']:
+                raise ValueError('Authenticated attached input differs')
         entry = bundle['entry']
         if entry not in bundle['files'] or not entry.endswith('.py'):
             raise ValueError('Missing entry')
