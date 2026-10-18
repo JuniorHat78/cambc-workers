@@ -16,4 +16,9 @@ Jobs are independent and GitHub enforces the account's concurrent runner limit.
 There are no scheduled workflows, automatic policy promotions or external service
 credentials. Re-running a job creates a separate sealed result for that attempt.
 
+Outputs use Actions artifacts with three-day retention. The export directories
+contain only encrypted bundles and generic receipts; compact indexes and full
+details are separate artifacts. Sealed input bundles remain release assets.
+An optional explicit shard list supports reviewed recovery of missing results.
+
 Run the generic contracts with `python -m unittest -q test_worker`.

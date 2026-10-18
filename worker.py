@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import traceback
 from urllib.request import Request, urlopen
 
 from sealed import MAX_BYTES, extract_checked, pack_checked, seal, sha, unseal
+from artifact_io import extract_export
 
 
 def child_environment(directory):
@@ -52,6 +54,25 @@ def fetch(repo, tag, name, target, expected=None):
                 out.write(block)
     if expected and sha(target) != expected:
         raise ValueError('Transport digest mismatch')
+
+
+def fetch_artifact(repo, item, target):
+    artifact_id = item['artifact_id']
+    if type(artifact_id) is not int or artifact_id <= 0:
+        raise ValueError('Invalid artifact identity')
+    archive = target.with_suffix('.zip')
+    with archive.open('xb') as output:
+        process = subprocess.run(['gh', 'api', f'repos/{repo}/actions/artifacts/{artifact_id}/zip'],
+            stdout=output, stderr=subprocess.PIPE, timeout=300)
+    if process.returncode or archive.stat().st_size > MAX_BYTES + 1024**2:
+        raise ValueError('Artifact transport failed')
+    stem = item['asset'].removesuffix('.box')
+    directory = target.with_suffix('.export')
+    extract_export(archive, directory, stem, 'full')
+    source = directory / item['asset']
+    if sha(source) != item['sha256']:
+        raise ValueError('Artifact digest differs')
+    shutil.copyfile(source, target)
 
 
 def execute(entry, runtime, output, shard, env, seconds):
@@ -103,7 +124,10 @@ def run(args):
                     or not re.fullmatch(r'[a-z0-9_-]+', item['label'])):
                 raise ValueError('Invalid sealed input identity')
             encrypted_input = root / f'attachment-{index}.box'
-            fetch(args.repo, item['tag'], item['asset'], encrypted_input, item['sha256'])
+            if 'artifact_id' in item:
+                fetch_artifact(args.repo, item, encrypted_input)
+            else:
+                fetch(args.repo, item['tag'], item['asset'], encrypted_input, item['sha256'])
             input_archive = root / f'attachment-{index}.tar.gz'
             unseal(encrypted_input, input_archive, key)
             recovered = extract_checked(input_archive, runtime / 'inputs' / item['label'])
@@ -131,20 +155,29 @@ def run(args):
     encrypted = root / (name + '.box')
     seal(root / 'output.tar.gz', encrypted, key)
     index_metadata = {}
+    index_box = None
     if (output / 'index').is_dir():
         pack_checked(output / 'index', root / 'index.tar.gz', {'identity': identity,
                      'input_cipher_sha256': input_digest, 'status': status})
         index_box = root / (name + '-index.box')
         seal(root / 'index.tar.gz', index_box, key)
-        gh('release', 'upload', args.tag, str(index_box), '--repo', args.repo)
         index_metadata = {'index_asset': index_box.name, 'index_cipher_sha256': sha(index_box)}
     # Do not overwrite another attempt; collection verifies the sealed identity.
-    gh('release', 'upload', args.tag, str(encrypted), '--repo', args.repo)
     receipt = root / (name + '.json')
     receipt.write_text(json.dumps({'schema': 1, **identity, 'status': status,
         'input_cipher_sha256': input_digest, 'output_cipher_sha256': sha(encrypted),
         'asset': encrypted.name, **index_metadata}), encoding='utf-8')
-    gh('release', 'upload', args.tag, str(receipt), '--repo', args.repo)
+    if args.transport == 'artifact':
+        # Export an explicit allowlist only. Workload files and logs cannot
+        # enter the public artifact unless already authenticated and encrypted.
+        for kind, box in (('index', index_box or encrypted), ('full', encrypted)):
+            destination = root / ('export-' + kind)
+            destination.mkdir()
+            shutil.copyfile(box, destination / box.name)
+            shutil.copyfile(receipt, destination / receipt.name)
+    else:
+        assets = ([str(index_box)] if index_box else []) + [str(encrypted), str(receipt)]
+        gh('release', 'upload', args.tag, *assets, '--repo', args.repo)
     print(json.dumps({'shard': args.shard, 'status': status}), flush=True)
     return 0 if status == 'succeeded' else 1
 
@@ -155,6 +188,7 @@ def main():
     parser.add_argument('--tag', required=True)
     parser.add_argument('--shard', type=int, required=True)
     parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--transport', choices=('release', 'artifact'), default='release')
     args = parser.parse_args()
     try:
         return run(args)

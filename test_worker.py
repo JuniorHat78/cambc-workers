@@ -1,16 +1,21 @@
 import contextlib
+import argparse
+import base64
 import io
 import json
 import os
 from pathlib import Path
 import tarfile
+import shutil
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from cryptography.exceptions import InvalidTag
 import sealed
 import worker
+from artifact_io import extract_export
 
 
 class Contracts(unittest.TestCase):
@@ -90,6 +95,46 @@ class Contracts(unittest.TestCase):
             self.assertNotEqual(code, 0)
             self.assertEqual(captured.getvalue(), '')
             self.assertIn('private exception', (output / 'execution.log').read_text())
+
+    def test_artifact_exports_only_sealed_bytes_and_receipts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'payload';source.mkdir()
+            (source/'entry.py').write_text("print('private artifact canary')")
+            tag='r'+'a'*24;key=os.urandom(32)
+            sealed.pack_checked(source,root/'input.tar.gz',
+                {'job_tag':tag,'shards':1,'entry':'entry.py','timeout_seconds':20})
+            sealed.seal(root/'input.tar.gz',root/'input.box',key)
+            def fetch(repo,job,name,target):shutil.copyfile(root/'input.box',target)
+            args=argparse.Namespace(repo='owner/repo',tag=tag,shard=0,out=root/'work',transport='artifact')
+            with patch.dict(os.environ,{'BOX_KEY':base64.b64encode(key).decode(),
+                    'GITHUB_RUN_ID':'123','GITHUB_RUN_ATTEMPT':'1'}),patch.object(worker,'fetch',fetch),\
+                    patch.object(worker,'gh',side_effect=AssertionError('No release API calls')):
+                self.assertEqual(worker.run(args),0)
+            for kind in ('index','full'):
+                files=list((args.out/('export-'+kind)).iterdir())
+                self.assertEqual(len(files),2)
+                for file in files:
+                    self.assertRegex(file.name,r'^result-000-123-1(?:-index)?\.(box|json)$')
+                    self.assertNotIn(b'private artifact canary',file.read_bytes())
+                    self.assertNotIn(base64.b64encode(key),file.read_bytes())
+
+    def test_artifact_inventory(self):
+        stem='result-001-123-1'
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            for case,names in enumerate(((stem+'.json',stem+'-index.box'),
+                    (stem+'.json','../private'),(stem+'.json','execution.log'),
+                    (stem+'.json',stem+'.box','extra'),(stem+'.json',stem+'.json'))):
+                archive=root/f'{case}.zip'
+                with zipfile.ZipFile(archive,'w') as zipped:
+                    for name in names:zipped.writestr(name,b'opaque')
+                if case==0:
+                    receipt=extract_export(archive,root/'good',stem,'index')
+                    self.assertEqual(receipt.read_bytes(),b'opaque')
+                else:
+                    with self.assertRaises(ValueError):
+                        extract_export(archive,root/f'bad-{case}',stem,'index')
+                    self.assertFalse((root/f'bad-{case}').exists())
 
 
 if __name__ == '__main__':

@@ -12,8 +12,14 @@ on:
         required: true
         default: '1'
         type: string
+      shard_indices:
+        description: Optional explicit shard indices for reviewed recovery
+        required: false
+        default: ''
+        type: string
 permissions:
-  contents: write
+  contents: read
+  actions: read
 concurrency:
   group: sealed-${{ inputs.tag }}
   cancel-in-progress: false
@@ -32,14 +38,18 @@ jobs:
         env:
           COUNT: ${{ inputs.shards }}
           TAG: ${{ inputs.tag }}
+          INDICES: ${{ inputs.shard_indices }}
         run: |
           python3 - <<'PY'
           import json, os, re
           count = int(os.environ['COUNT'])
           assert 1 <= count <= 256
           assert re.fullmatch(r'r[0-9a-f]{24}', os.environ['TAG'])
+          indices = json.loads(os.environ['INDICES']) if os.environ['INDICES'] else list(range(count))
+          assert isinstance(indices, list) and indices and len(set(indices)) == len(indices)
+          assert all(type(i) is int and 0 <= i < count for i in indices)
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('shards=' + json.dumps(list(range(count))) + '\n')
+              f.write('shards=' + json.dumps(indices) + '\n')
           PY
   worker:
     needs: matrix
@@ -66,4 +76,22 @@ jobs:
           REPO: ${{ github.repository }}
           TAG: ${{ inputs.tag }}
           SHARD: ${{ matrix.shard }}
-        run: python -B worker.py --repo "$REPO" --tag "$TAG" --shard "$SHARD" --out "$RUNNER_TEMP/sealed-work"
+        run: python -B worker.py --repo "$REPO" --tag "$TAG" --shard "$SHARD" --out "$RUNNER_TEMP/sealed-work" --transport artifact
+      - name: Return sealed index
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: index-${{ inputs.tag }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sealed-work/export-index/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+      - name: Return sealed details
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: full-${{ inputs.tag }}-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sealed-work/export-full/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
