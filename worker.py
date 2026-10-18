@@ -117,12 +117,20 @@ def run(args):
     name = f"result-{args.shard:03d}-{identity['run']}-{identity['attempt']}"
     encrypted = root / (name + '.box')
     seal(root / 'output.tar.gz', encrypted, key)
+    index_metadata = {}
+    if (output / 'index').is_dir():
+        pack_checked(output / 'index', root / 'index.tar.gz', {'identity': identity,
+                     'input_cipher_sha256': input_digest, 'status': status})
+        index_box = root / (name + '-index.box')
+        seal(root / 'index.tar.gz', index_box, key)
+        gh('release', 'upload', args.tag, str(index_box), '--repo', args.repo)
+        index_metadata = {'index_asset': index_box.name, 'index_cipher_sha256': sha(index_box)}
     # Do not overwrite another attempt; collection verifies the sealed identity.
     gh('release', 'upload', args.tag, str(encrypted), '--repo', args.repo)
     receipt = root / (name + '.json')
     receipt.write_text(json.dumps({'schema': 1, **identity, 'status': status,
         'input_cipher_sha256': input_digest, 'output_cipher_sha256': sha(encrypted),
-        'asset': encrypted.name}), encoding='utf-8')
+        'asset': encrypted.name, **index_metadata}), encoding='utf-8')
     gh('release', 'upload', args.tag, str(receipt), '--repo', args.repo)
     print(json.dumps({'shard': args.shard, 'status': status}), flush=True)
     return 0 if status == 'succeeded' else 1
