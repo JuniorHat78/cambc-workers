@@ -1,0 +1,147 @@
+"""Execute one shard of a sealed, owner-supplied offline workload.
+
+Only ciphertext, opaque identities and generic execution receipts leave here.
+Workload stdout, stderr, exception text, plans and results stay in sealed output.
+"""
+from __future__ import annotations
+import argparse
+import base64
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+import traceback
+from urllib.request import Request, urlopen
+
+from sealed import MAX_BYTES, extract_checked, pack_checked, seal, sha, unseal
+
+
+def child_environment(directory):
+    # An allowlist avoids passing newly introduced provider secrets by accident.
+    names = ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'LANG', 'LC_ALL',
+             'LD_LIBRARY_PATH', 'SSL_CERT_FILE', 'SSL_CERT_DIR')
+    env = {name: os.environ[name] for name in names if name in os.environ}
+    private_home = str(Path(directory).resolve())
+    env.update(HOME=private_home, USERPROFILE=private_home, TMPDIR=private_home,
+               TEMP=private_home, TMP=private_home, PYTHONUNBUFFERED='1',
+               OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    return env
+
+
+def gh(*args):
+    process = subprocess.run(['gh', *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             timeout=300, check=False)
+    if process.returncode:
+        raise RuntimeError('Transport failed')
+    return process.stdout
+
+
+def fetch(repo, tag, name, target, expected=None):
+    url = f'https://github.com/{repo}/releases/download/{tag}/{name}'
+    with urlopen(Request(url, headers={'User-Agent': 'opaque-worker/1'}), timeout=120) as response:
+        total = 0
+        with Path(target).open('xb') as out:
+            while block := response.read(1024**2):
+                total += len(block)
+                if total > MAX_BYTES + 64:
+                    raise ValueError('Transport size limit')
+                out.write(block)
+    if expected and sha(target) != expected:
+        raise ValueError('Transport digest mismatch')
+
+
+def execute(entry, runtime, output, shard, env, seconds):
+    command = [sys.executable, '-u', str(entry), '--output', str(output), '--shard', str(shard)]
+    with (output / 'execution.log').open('wb') as log:
+        process = subprocess.Popen(command, cwd=runtime, env=env, stdout=log, stderr=log,
+                                   start_new_session=os.name != 'nt')
+        try:
+            return process.wait(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                               stdout=log, stderr=log, timeout=30)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=30)
+            return 124
+
+
+def run(args):
+    if (not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repo)
+            or not re.fullmatch(r'r[0-9a-f]{24}', args.tag)
+            or not 0 <= args.shard < 256):
+        raise ValueError('Invalid job identity')
+    key = base64.b64decode(os.environ['BOX_KEY'], validate=True)
+    if len(key) != 32:
+        raise ValueError('Invalid key')
+    root = args.out.resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    output = root / 'output'
+    output.mkdir()
+    status = 'failed'
+    started = time.monotonic()
+    identity = {'tag': args.tag, 'shard': args.shard, 'run': os.environ.get('GITHUB_RUN_ID', 'local'),
+                'attempt': os.environ.get('GITHUB_RUN_ATTEMPT', '1')}
+    input_digest = None
+    try:
+        fetch(args.repo, args.tag, 'input.box', root / 'input.box')
+        input_digest = sha(root / 'input.box')
+        unseal(root / 'input.box', root / 'input.tar.gz', key)
+        runtime = root / 'runtime'
+        bundle = extract_checked(root / 'input.tar.gz', runtime)
+        if bundle.get('job_tag') != args.tag or not args.shard < bundle.get('shards', 0):
+            raise ValueError('Encrypted workload identity differs')
+        entry = bundle['entry']
+        if entry not in bundle['files'] or not entry.endswith('.py'):
+            raise ValueError('Missing entry')
+        seconds = bundle['timeout_seconds']
+        if type(seconds) is not int or not 1 <= seconds <= 18000:
+            raise ValueError('Invalid timeout')
+        env_home = root / 'home'
+        env_home.mkdir()
+        code = execute(runtime / entry, runtime, output, args.shard,
+                       child_environment(env_home), seconds)
+        (output / 'worker-private.json').write_text(json.dumps({**identity,
+            'input_cipher_sha256': input_digest, 'returncode': code,
+            'seconds': time.monotonic() - started, 'cpu_count': os.cpu_count()}), encoding='utf-8')
+        status = 'succeeded' if code == 0 else 'failed'
+    except Exception:
+        (output / 'worker-error.txt').write_text(traceback.format_exc(), encoding='utf-8')
+    pack_checked(output, root / 'output.tar.gz', {'identity': identity,
+                 'input_cipher_sha256': input_digest, 'status': status})
+    name = f"result-{args.shard:03d}-{identity['run']}-{identity['attempt']}"
+    encrypted = root / (name + '.box')
+    seal(root / 'output.tar.gz', encrypted, key)
+    # Do not overwrite another attempt; collection verifies the sealed identity.
+    gh('release', 'upload', args.tag, str(encrypted), '--repo', args.repo)
+    receipt = root / (name + '.json')
+    receipt.write_text(json.dumps({'schema': 1, **identity, 'status': status,
+        'input_cipher_sha256': input_digest, 'output_cipher_sha256': sha(encrypted),
+        'asset': encrypted.name}), encoding='utf-8')
+    gh('release', 'upload', args.tag, str(receipt), '--repo', args.repo)
+    print(json.dumps({'shard': args.shard, 'status': status}), flush=True)
+    return 0 if status == 'succeeded' else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', required=True)
+    parser.add_argument('--tag', required=True)
+    parser.add_argument('--shard', type=int, required=True)
+    parser.add_argument('--out', type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        return run(args)
+    except Exception:
+        # Never expose private exception messages or tracebacks to public logs.
+        print('Worker transport failed; inspect the sealed receipt if available.', flush=True)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

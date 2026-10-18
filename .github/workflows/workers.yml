@@ -1,0 +1,69 @@
+name: Sealed workers
+run-name: ${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Opaque release identity
+        required: true
+        type: string
+      shards:
+        description: Number of independent shards (1 to 256)
+        required: true
+        default: '1'
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: sealed-${{ inputs.tag }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  matrix:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    outputs:
+      shards: ${{ steps.matrix.outputs.shards }}
+    steps:
+      - id: matrix
+        env:
+          COUNT: ${{ inputs.shards }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+          count = int(os.environ['COUNT'])
+          assert 1 <= count <= 256
+          assert re.fullmatch(r'r[0-9a-f]{24}', os.environ['TAG'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('shards=' + json.dumps(list(range(count))) + '\n')
+          PY
+  worker:
+    needs: matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 315
+    strategy:
+      fail-fast: false
+      max-parallel: 256
+      matrix:
+        shard: ${{ fromJSON(needs.matrix.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --disable-pip-version-check cryptography==42.0.8
+      - run: python -B -m unittest -q test_worker
+      - name: Run sealed workload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOX_KEY: ${{ secrets.BOX_KEY }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          SHARD: ${{ matrix.shard }}
+        run: python -B worker.py --repo "$REPO" --tag "$TAG" --shard "$SHARD" --out "$RUNNER_TEMP/sealed-work"
