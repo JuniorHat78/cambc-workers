@@ -6,6 +6,7 @@ Workload stdout, stderr, exception text, plans and results stay in sealed output
 from __future__ import annotations
 import argparse
 import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -75,14 +76,23 @@ def fetch_artifact(repo, item, target):
     shutil.copyfile(source, target)
 
 
-def execute(entry, runtime, output, shard, env, seconds):
+def execute(entry, runtime, output, shard, env, seconds, progress=None, progress_seconds=180):
     command = [sys.executable, '-u', str(entry), '--output', str(output), '--shard', str(shard)]
     with (output / 'execution.log').open('wb') as log:
         process = subprocess.Popen(command, cwd=runtime, env=env, stdout=log, stderr=log,
                                    start_new_session=os.name != 'nt')
-        try:
-            return process.wait(timeout=seconds)
-        except subprocess.TimeoutExpired:
+        deadline=time.monotonic()+seconds
+        while time.monotonic()<deadline:
+            try:
+                return process.wait(timeout=min(progress_seconds if progress else seconds,max(.001,deadline-time.monotonic())))
+            except subprocess.TimeoutExpired:
+                if progress and time.monotonic()<deadline:
+                    try:progress()
+                    except Exception:
+                        # Diagnostic transport must never expose private errors
+                        # in public logs or kill a healthy training process.
+                        with (output/'progress-error.txt').open('a',encoding='utf8') as f:f.write(traceback.format_exc())
+        if process.poll() is None:
             if os.name == 'nt':
                 subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
                                stdout=log, stderr=log, timeout=30)
@@ -90,6 +100,28 @@ def execute(entry, runtime, output, shard, env, seconds):
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=30)
             return 124
+        return process.returncode
+
+
+def progress_export(args,root,output,key,identity,input_digest):
+    source=output/'progress.json';sequence=0;last=None
+    def publish():
+        nonlocal sequence,last
+        if not source.is_file() or source.is_symlink() or source.stat().st_size>2*1024**2:return
+        data=source.read_bytes();digest=hashlib.sha256(data).hexdigest()
+        if digest==last:return
+        json.loads(data)  # Reject torn or non-JSON progress; producer uses atomic rename.
+        sequence+=1;directory=root/f'progress-{sequence:04d}';directory.mkdir()
+        (directory/'progress.json').write_bytes(data)
+        name=f"progress-{identity['shard']:03d}-{identity['run']}-{identity['attempt']}-{sequence:04d}"
+        archive=root/(name+'.tar.gz');box=root/(name+'.box');receipt=root/(name+'.json')
+        pack_checked(directory,archive,dict(identity=identity,input_cipher_sha256=input_digest,status='running'))
+        seal(archive,box,key)
+        receipt.write_text(json.dumps(dict(schema=1,**identity,status='running',sequence=sequence,
+            input_cipher_sha256=input_digest,asset=box.name,output_cipher_sha256=sha(box))),encoding='utf8')
+        gh('release','upload',args.tag,str(box),str(receipt),'--repo',args.repo)
+        last=digest
+    return publish
 
 
 def run(args):
@@ -141,8 +173,13 @@ def run(args):
             raise ValueError('Invalid timeout')
         env_home = root / 'home'
         env_home.mkdir()
+        progress=None;interval=bundle.get('progress_seconds',180)
+        if 'progress_seconds' in bundle:
+            if type(interval) is not int or not 60<=interval<=1800 or args.transport not in ('release','both'):
+                raise ValueError('Invalid live progress transport')
+            progress=progress_export(args,root,output,key,identity,input_digest)
         code = execute(runtime / entry, runtime, output, args.shard,
-                       child_environment(env_home), seconds)
+                       child_environment(env_home), seconds,progress,interval)
         (output / 'worker-private.json').write_text(json.dumps({**identity,
             'input_cipher_sha256': input_digest, 'returncode': code,
             'seconds': time.monotonic() - started, 'cpu_count': os.cpu_count()}), encoding='utf-8')

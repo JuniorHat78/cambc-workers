@@ -19,6 +19,33 @@ from artifact_io import extract_export
 
 
 class Contracts(unittest.TestCase):
+    def test_live_progress_is_encrypted_and_unchanged_snapshots_are_not_repeated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);output=root/'output';output.mkdir();key=os.urandom(32)
+            (output/'progress.json').write_text(json.dumps({'private':'metric canary'}))
+            args=argparse.Namespace(repo='owner/repo',tag='r'+'a'*24)
+            identity=dict(tag=args.tag,shard=0,run='123',attempt='1');calls=[]
+            publish=worker.progress_export(args,root,output,key,identity,'input-digest')
+            with patch.object(worker,'gh',side_effect=lambda *a:calls.append(a)):
+                publish();publish()
+            self.assertEqual(len(calls),1)
+            for item in calls[0][3:5]:
+                self.assertNotIn(b'metric canary',Path(item).read_bytes())
+            box=root/'progress-000-123-1-0001.box'
+            sealed.unseal(box,root/'recovered.tar.gz',key)
+            manifest=sealed.extract_checked(root/'recovered.tar.gz',root/'recovered')
+            self.assertEqual(manifest['identity'],identity)
+            self.assertEqual(json.loads((root/'recovered/progress.json').read_text())['private'],'metric canary')
+
+    def test_progress_callback_preserves_private_execution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);output=root/'output';output.mkdir()
+            script=root/'entry.py';script.write_text('import time; time.sleep(.15)')
+            calls=[]
+            self.assertEqual(worker.execute(script,root,output,0,worker.child_environment(root),3,
+                lambda:calls.append(1),.03),0)
+            self.assertTrue(calls)
+
     def test_roundtrip_and_tampering(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
