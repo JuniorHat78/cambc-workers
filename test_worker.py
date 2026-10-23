@@ -136,6 +136,24 @@ class Contracts(unittest.TestCase):
                         extract_export(archive,root/f'bad-{case}',stem,'index')
                     self.assertFalse((root/f'bad-{case}').exists())
 
+    def test_durable_transport_only_uploads_sealed_result_and_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/'payload';source.mkdir();tag='r'+'b'*24;key=os.urandom(32)
+            (source/'entry.py').write_text("print('private durable canary')")
+            sealed.pack_checked(source,root/'input.tar.gz',dict(job_tag=tag,shards=1,entry='entry.py',timeout_seconds=20))
+            sealed.seal(root/'input.tar.gz',root/'input.box',key)
+            def fetch(repo,job,name,target):shutil.copyfile(root/'input.box',target)
+            args=argparse.Namespace(repo='owner/repo',tag=tag,shard=0,out=root/'work',transport='both')
+            with patch.dict(os.environ,{'BOX_KEY':base64.b64encode(key).decode(),'GITHUB_RUN_ID':'124','GITHUB_RUN_ATTEMPT':'1'}),\
+                 patch.object(worker,'fetch',fetch),patch.object(worker,'gh') as upload:
+                self.assertEqual(worker.run(args),0)
+            call=upload.call_args.args
+            self.assertEqual(call[:3],('release','upload',tag));self.assertEqual(call[-2:],('--repo','owner/repo'))
+            for name in call[3:-2]:
+                self.assertIn(Path(name).suffix,('.box','.json'))
+                self.assertNotIn(b'private durable canary',Path(name).read_bytes())
+            self.assertTrue((args.out/'export-full').is_dir())
+
 
 if __name__ == '__main__':
     unittest.main()

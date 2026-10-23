@@ -167,7 +167,7 @@ def run(args):
     receipt.write_text(json.dumps({'schema': 1, **identity, 'status': status,
         'input_cipher_sha256': input_digest, 'output_cipher_sha256': sha(encrypted),
         'asset': encrypted.name, **index_metadata}), encoding='utf-8')
-    if args.transport == 'artifact':
+    if args.transport in ('artifact','both'):
         # Export an explicit allowlist only. Workload files and logs cannot
         # enter the public artifact unless already authenticated and encrypted.
         for kind, box in (('index', index_box or encrypted), ('full', encrypted)):
@@ -175,7 +175,7 @@ def run(args):
             destination.mkdir()
             shutil.copyfile(box, destination / box.name)
             shutil.copyfile(receipt, destination / receipt.name)
-    else:
+    if args.transport in ('release','both'):
         assets = ([str(index_box)] if index_box else []) + [str(encrypted), str(receipt)]
         gh('release', 'upload', args.tag, *assets, '--repo', args.repo)
     print(json.dumps({'shard': args.shard, 'status': status}), flush=True)
@@ -188,7 +188,7 @@ def main():
     parser.add_argument('--tag', required=True)
     parser.add_argument('--shard', type=int, required=True)
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--transport', choices=('release', 'artifact'), default='release')
+    parser.add_argument('--transport', choices=('release', 'artifact','both'), default='release')
     args = parser.parse_args()
     try:
         return run(args)
